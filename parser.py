@@ -1,11 +1,12 @@
 import os
 import io
 import re
+from urllib.parse import urljoin
+from datetime import datetime, timedelta
 import requests
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from supabase import create_client, Client
-from datetime import datetime, timedelta
 
 print("--- ЗАПУСК ПАРСЕРА ---", flush=True)
 
