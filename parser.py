@@ -7,12 +7,8 @@ from pypdf import PdfReader
 import requests
 from supabase import Client, create_client
 
-URL = os.environ.get("SUPABASE_URL") or "https://ТВОЙ_ПРОЕКТ.supabase.co"
-KEY = os.environ.get("SUPABASE_KEY")
-
-if not URL or not KEY:
-  print("Ошибка: Нет ключей Supabase!")
-  exit(1)
+URL = "https://wacvxwqdxoufcbfbldoa.supabase.co"
+KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndhY3Z4d3FkeG91ZmNiZmJsZG9hIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTI2MDQyNTMsImV4cCI6MjEwODE4MDI1M30.fhRWe94_JinXEGtvWFhq-hzN3J-um5tM3P5Snj3RojM"
 
 supabase: Client = create_client(URL, KEY)
 
@@ -35,6 +31,7 @@ def parse_pdf_for_group(pdf_bytes, building_num, schedule_date):
         if c:
           all_lines.append(c)
 
+  # Ищет ДА-61, ДА 61, DA-61 в любом регистре
   group_regex = re.compile(r"\b[дdДD][аaАA][\s\-_–—]?61\b", re.IGNORECASE)
   found_idx = -1
   for i, line in enumerate(all_lines):
@@ -45,7 +42,9 @@ def parse_pdf_for_group(pdf_bytes, building_num, schedule_date):
 
   records = []
   if found_idx != -1:
-    next_group_regex = re.compile(r"\b[а-яА-Яa-zA-Z]{1,4}[\s\-_–—]?\d{1,3}\b")
+    next_group_regex = re.compile(
+        r"\b[а-яА-Яa-zA-Z]{1,4}[\s\-_–—]?\d{1,3}\b"
+    )
     lesson_idx = 1
     for line in all_lines[found_idx + 1 : found_idx + 25]:
       if (
@@ -89,9 +88,7 @@ def get_schedule():
 
   date_m = re.search(r"на\s+(\d{1,2}\s+[а-яА-Я]+\s+\d{4})", res.text)
   schedule_date = date_m.group(1) if date_m else "Сегодня"
-  print("Дата расписания:", schedule_date)
 
-  # Ищем ссылки отдельно на 1-2 корпус и 3 корпус
   pdf_targets = []
   for a in soup.find_all("a", href=True):
     txt = a.get_text(strip=True).lower()
@@ -102,7 +99,7 @@ def get_schedule():
       else:
         pdf_targets.append((href, 1))
 
-  # Очищаем базу перед обновлением
+  # Очищаем старые записи
   try:
     supabase.table("schedule").delete().eq("group_name", "ДА-61").execute()
   except Exception as e:
@@ -110,7 +107,6 @@ def get_schedule():
 
   all_records = []
   for link, b_num in pdf_targets:
-    print(f"2. Качаем {b_num} корпус: {link}")
     pdf_res = requests.get(link, headers=headers)
     if pdf_res.status_code == 200:
       recs = parse_pdf_for_group(pdf_res.content, b_num, schedule_date)
@@ -118,9 +114,9 @@ def get_schedule():
 
   if all_records:
     supabase.table("schedule").upsert(all_records).execute()
-    print(f"ГОТОВО! Успешно записано пар: {len(all_records)}")
+    print(f"Готово! Записано пар: {len(all_records)}")
   else:
-    print("Пар для ДА-61 не найдено ни в одном из корпусов.")
+    print("Пар для ДА-61 не найдено.")
 
 
 if __name__ == "__main__":
