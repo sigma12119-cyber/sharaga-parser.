@@ -5,7 +5,7 @@ from urllib.parse import urljoin
 from datetime import datetime, timedelta
 import requests
 from bs4 import BeautifulSoup
-from pypdf import PdfReader
+import pdfplumber
 from supabase import create_client, Client
 
 print("--- ЗАПУСК ПАРСЕРА ---", flush=True)
@@ -22,84 +22,93 @@ def clean_text(t):
     return re.sub(r'\s+', ' ', t).strip()
 
 def parse_pdf_for_group(pdf_bytes, building_num, schedule_date):
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    all_lines = []
-    for page in reader.pages:
-        text = page.extract_text()
-        if text:
-            for line in text.split("\n"):
-                c = clean_text(line)
-                if c:
-                    all_lines.append(c)
-
     group_regex = re.compile(r'\b[дdДD][аaАA][\s\-_–—]?61\b', re.IGNORECASE)
-    any_group_regex = re.compile(r'\b[а-яА-Яa-zA-Z]{1,4}[\s\-_–—]?\d{2}\b')
-
-    found_idx = -1
-    col_index = 0
-    total_cols = 1
-
-    for i, line in enumerate(all_lines):
-        if group_regex.search(line):
-            found_idx = i
-            # Считаем все группы в этой строке (например: ДА-61 ДА-62 ДА-63)
-            groups_in_row = any_group_regex.findall(line)
-            if groups_in_row:
-                total_cols = len(groups_in_row)
-                for idx, g in enumerate(groups_in_row):
-                    if group_regex.search(g):
-                        col_index = idx
-                        break
-            print(f"[{building_num} корп.] Найдена ДА-61 на стр. {i}: '{line}' (Колонка {col_index+1} из {total_cols})", flush=True)
-            break
+    any_group_regex = re.compile(r'^[А-ЯA-Z]{2,4}[\s\-_–—]?\d{2}$')
 
     records = []
-    if found_idx != -1:
-        for line in all_lines[found_idx + 1:found_idx + 25]:
-            # Если началась следующая строка групп (например ДР-41 ДР-42) — выходим
-            if any_group_regex.search(line) and not re.search(r'каб|ауд', line.lower()):
-                break
-            if any(w in line.lower() for w in ["пятница", "понедельник", "вторник", "среда", "четверг", "суббота"]):
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            words = page.extract_words()
+            target_word = None
+            for w in words:
+                if group_regex.search(w['text']):
+                    target_word = w
+                    break
+
+            if not target_word:
                 continue
 
-            # Ищем строку, которая начинается с номера пары (1, 2, 3, 4, 5, 6)
-            m_num = re.match(r'^([1-6])\s+(.*)', line)
-            if not m_num:
+            # Определяем, в какой из 3 колонок (левая, средняя, правая) находится ДА-61
+            W = page.width
+            H = page.height
+            cx = (target_word['x0'] + target_word['x1']) / 2
+
+            if cx < W * 0.35:
+                x0, x1 = 0, W * 0.345
+            elif cx < W * 0.68:
+                x0, x1 = W * 0.345, W * 0.675
+            else:
+                x0, x1 = W * 0.675, W
+
+            # Вырезаем прямоугольник ТОЛЬКО нашей группы (от шапки ДА-61 вниз)
+            y0 = max(0, target_word['top'] - 5)
+            y1 = min(H, target_word['top'] + 260)
+
+            cropped = page.crop((x0, y0, x1, y1))
+            text = cropped.extract_text(layout=False)
+            if not text:
                 continue
 
-            lesson_num = int(m_num.group(1))
-            # Если в строке только цифры типа "5 5 5" или "6 6 6" — значит пар нет, пропускаем
-            if re.match(r'^[1-6](\s+[1-6])+$', line):
-                continue
+            lines = [clean_text(line) for line in text.split('\n') if clean_text(line)]
+            print(f"[{building_num} корп.] Вырезанный блок ДА-61:\n" + "\n".join(lines), flush=True)
 
-            # Разбиваем склеенную строку по номеру пары (например, по " 1 ", " 2 ", " 3 ")
-            parts = re.split(rf'\b{lesson_num}\s+', line)
-            parts = [p.strip() for p in parts if p.strip()]
+            current_lesson = None
+            lesson_data = {}
 
-            if not parts:
-                continue
+            for line in lines[1:]:
+                # Если наткнулись на следующую группу снизу (например ДР-33) — стоп!
+                if any_group_regex.match(line):
+                    break
+                if any(day in line.lower() for day in ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота"]):
+                    continue
 
-            # Берем именно нашу колонку
-            my_part = parts[col_index] if col_index < len(parts) else parts[0]
+                # Проверяем, начинается ли строка с номера пары (1..6)
+                m = re.match(r'^([1-6])(?:\s+(.*))?$', line)
+                if m:
+                    num = int(m.group(1))
+                    rest = (m.group(2) or "").strip()
+                    current_lesson = num
+                    if rest:
+                        lesson_data[current_lesson] = lesson_data.get(current_lesson, "") + " " + rest
+                else:
+                    # Если это перенос номера кабинета на вторую строчку (например "412" или "ДТ3")
+                    if current_lesson is not None:
+                        lesson_data[current_lesson] = lesson_data.get(current_lesson, "") + " " + line
 
-            # Вытаскиваем кабинет
-            room_m = re.search(r'(?:каб\.?|ауд\.?)\s*([0-9]{2,3}[а-яА-Я]?|[а-яА-Я0-9\-]+)', my_part, re.IGNORECASE)
-            default_room = "Энергетиков" if building_num == 3 else "Салова"
-            room = room_m.group(1) if room_m else default_room
+            for num in sorted(lesson_data.keys()):
+                full_str = clean_text(lesson_data[num])
+                if not full_str:
+                    continue
 
-            # Очищаем название предмета от слова "каб ..."
-            subj = re.sub(r',?\s*(?:каб\.?|ауд\.?)\s*([0-9]{2,3}[а-яА-Я]?|[а-яА-Я0-9\-]+).*', '', my_part, flags=re.IGNORECASE).strip()
+                # Вытаскиваем кабинет после слова "каб"
+                room_m = re.search(r'(?:каб\.?|ауд\.?)\s*([а-яА-Яa-zA-Z0-9\-]+)', full_str, re.IGNORECASE)
+                default_room = "Энергетиков" if building_num == 3 else "Салова"
+                room = room_m.group(1) if room_m else default_room
 
-            if len(subj) > 2:
+                # Убираем "каб ..." из названия предмета
+                subj = re.sub(r',?\s*(?:каб\.?|ауд\.?)\s*[а-яА-Яa-zA-Z0-9\-]+', '', full_str, flags=re.IGNORECASE).strip()
+
                 records.append({
                     "date": schedule_date,
                     "building": building_num,
                     "group_name": "ДА-61",
-                    "lesson_num": lesson_num,
+                    "lesson_num": num,
                     "subject": subj[:100],
                     "room": room,
                     "teacher": "По расписанию"
                 })
+            break
 
     return records
 
@@ -109,14 +118,12 @@ def get_schedule():
     res.encoding = "utf-8"
 
     soup = BeautifulSoup(res.text, "html.parser")
-    
     date_m = re.search(r'на\s+(\d{1,2}\s+[а-яА-Я]+\s+\d{4})', res.text)
     schedule_date = date_m.group(1) if date_m else "23 октября"
 
     now = datetime.now()
     target_date = now + timedelta(days=1) if now.hour >= 14 else now
     target_weekday = target_date.weekday()
-
     target_building = 3 if target_weekday in [0, 3] else 1
 
     pdf_targets = []
@@ -145,14 +152,14 @@ def get_schedule():
         except Exception as e:
             print(f"Ошибка PDF: {e}", flush=True)
 
-    # Полная очистка старых записей перед вставкой новых
+    # Очищаем все старые записи ДА-61
     try:
-        supabase.table("schedule").delete().neq("lesson_num", -999).execute()
+        supabase.table("schedule").delete().eq("group_name", "ДА-61").execute()
     except Exception as e:
         print(f"Ошибка очистки: {e}", flush=True)
 
     if all_records:
-        supabase.table("schedule").insert(all_records).execute()
+        supabase.table("schedule").upsert(all_records).execute()
         print(f"Готово! В Supabase сохранено {len(all_records)} пар.", flush=True)
     else:
         print("Внимание: пар для ДА-61 не найдено в PDF.", flush=True)
