@@ -1,5 +1,10 @@
 requests
 beautifulsoup4
+pypdf
+pdfplumber
+supabase
+pyTelegramBotAPIrequests
+beautifulsoup4
 supabase
 pypdf
 openpyxl
