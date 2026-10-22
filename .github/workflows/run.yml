@@ -2,9 +2,10 @@ name: Update Schedule Daily
 
 on:
   schedule:
-    - cron: '0 5,17 * * *'
-  workflow_dispatch:
-
+    # Запуск каждые 2 часа с 06:00 до 22:00 по МСК (это 03:00-19:00 UTC)
+    - cron: '0 3-19/2 * * *'
+  workflow_dispatch: # Оставляет кнопку ручного запуска Run workflow
+  
 jobs:
   scrape:
     runs-on: ubuntu-latest
