@@ -7,7 +7,6 @@ from pypdf import PdfReader
 import requests
 from supabase import Client, create_client
 
-# Укажи адрес своего проекта Supabase
 URL = os.environ.get("SUPABASE_URL") or "https://ТВОЙ_ПРОЕКТ.supabase.co"
 KEY = os.environ.get("SUPABASE_KEY")
 
@@ -19,7 +18,65 @@ supabase: Client = create_client(URL, KEY)
 
 BASE_URL = "http://xn--80a0ba.xn--90a1af.xn--p1ai"
 SCHEDULE_PAGE = f"{BASE_URL}/studentu/ochn"
-TARGET_GROUP = "ДА-61"
+
+
+def clean_text(t):
+  return re.sub(r"\s+", " ", t).strip()
+
+
+def parse_pdf_for_group(pdf_bytes, building_num, schedule_date):
+  reader = PdfReader(io.BytesIO(pdf_bytes))
+  all_lines = []
+  for page in reader.pages:
+    text = page.extract_text()
+    if text:
+      for line in text.split("\n"):
+        c = clean_text(line)
+        if c:
+          all_lines.append(c)
+
+  group_regex = re.compile(r"\b[дdДD][аaАA][\s\-_–—]?61\b", re.IGNORECASE)
+  found_idx = -1
+  for i, line in enumerate(all_lines):
+    if group_regex.search(line):
+      found_idx = i
+      print(f"[{building_num} корпус] Группа найдена на строке {i}: {line}")
+      break
+
+  records = []
+  if found_idx != -1:
+    next_group_regex = re.compile(r"\b[а-яА-Яa-zA-Z]{1,4}[\s\-_–—]?\d{1,3}\b")
+    lesson_idx = 1
+    for line in all_lines[found_idx + 1 : found_idx + 25]:
+      if (
+          next_group_regex.search(line)
+          and not group_regex.search(line)
+          and len(line) < 15
+      ):
+        break
+      if "корпус" in line.lower() or "расписание" in line.lower():
+        continue
+
+      room_m = re.search(r"\b(\d{2,3}[а-яА-Я]?|ауд\.?\s*\d+)\b", line)
+      default_room = "Салова" if building_num == 1 else "Энергетиков"
+      room = room_m.group(0) if room_m else default_room
+
+      subj = line
+      if room_m:
+        subj = subj.replace(room_m.group(0), "").strip()
+
+      if len(subj) > 2:
+        records.append({
+            "date": schedule_date,
+            "building": building_num,
+            "group_name": "ДА-61",
+            "lesson_num": lesson_idx,
+            "subject": subj[:100],
+            "room": room,
+            "teacher": "По расписанию",
+        })
+        lesson_idx += 1
+  return records
 
 
 def get_schedule():
@@ -28,92 +85,43 @@ def get_schedule():
   res = requests.get(SCHEDULE_PAGE, headers=headers)
   res.encoding = "utf-8"
 
-  if res.status_code != 200:
-    print("Ошибка загрузки сайта")
-    return
-
   soup = BeautifulSoup(res.text, "html.parser")
 
-  date_match = re.search(r"на\s+(\d{1,2}\s+[а-яА-Я]+\s+\d{4})", res.text)
-  schedule_date = date_match.group(1) if date_match else "Сегодня"
-  print("Дата:", schedule_date)
+  date_m = re.search(r"на\s+(\d{1,2}\s+[а-яА-Я]+\s+\d{4})", res.text)
+  schedule_date = date_m.group(1) if date_m else "Сегодня"
+  print("Дата расписания:", schedule_date)
 
-  target_link = None
+  # Ищем ссылки отдельно на 1-2 корпус и 3 корпус
+  pdf_targets = []
   for a in soup.find_all("a", href=True):
     txt = a.get_text(strip=True).lower()
+    href = urljoin(BASE_URL, a["href"])
     if "расписание" in txt and "групп" in txt:
-      target_link = urljoin(BASE_URL, a["href"])
-      break
+      if "3" in txt or "энергетиков" in txt:
+        pdf_targets.append((href, 3))
+      else:
+        pdf_targets.append((href, 1))
 
-  if not target_link:
-    print("Ссылка на PDF не найдена")
-    return
-
-  print("2. Скачивание PDF:", target_link)
-  pdf_res = requests.get(target_link, headers=headers)
-  if pdf_res.status_code != 200:
-    print("Ошибка скачивания файла")
-    return
-
-  reader = PdfReader(io.BytesIO(pdf_res.content))
-  full_text = ""
-  for page in reader.pages:
-    txt = page.extract_text()
-    if txt:
-      full_text += txt + "\n"
-
-  print("3. Поиск группы:", TARGET_GROUP)
-  records = []
-  pattern = rf"{TARGET_GROUP}(.*?)(?=[А-Я]{{1,3}}-\d{{1,2}}|\Z)"
-  match = re.search(pattern, full_text, re.DOTALL | re.IGNORECASE)
-
-  if match:
-    lines = [
-        ln.strip() for ln in match.group(1).split("\n") if len(ln.strip()) > 3
-    ]
-    idx = 1
-    for ln in lines:
-      if "корпус" in ln.lower():
-        continue
-      room_m = re.search(r"\b(\d{2,3}[а-яА-Я]?|ауд\.?\s*\d+)\b", ln)
-      room = room_m.group(0) if room_m else "Салова"
-      records.append({
-          "date": schedule_date,
-          "building": 1,
-          "group_name": TARGET_GROUP,
-          "lesson_num": idx,
-          "subject": ln[:80],
-          "room": room,
-          "teacher": "По расписанию",
-      })
-      idx += 1
-
-  if not records:
-    records.append({
-        "date": schedule_date,
-        "building": 1,
-        "group_name": TARGET_GROUP,
-        "lesson_num": 1,
-        "subject": "Расписание уточняется (чекни PDF)",
-        "room": "—",
-        "teacher": "—",
-    })
-
+  # Очищаем базу перед обновлением
   try:
-    supabase.table("schedule").delete().match({
-        "date": schedule_date,
-        "group_name": TARGET_GROUP,
-    }).execute()
+    supabase.table("schedule").delete().eq("group_name", "ДА-61").execute()
   except Exception as e:
-    print("Очистка старых строк:", e)
+    print("Ошибка очистки:", e)
 
-  try:
-    supabase.table("schedule").upsert(records).execute()
-    print("Успешно записано строк:", len(records))
-  except Exception as e:
-    print("Ошибка Supabase:", e)
+  all_records = []
+  for link, b_num in pdf_targets:
+    print(f"2. Качаем {b_num} корпус: {link}")
+    pdf_res = requests.get(link, headers=headers)
+    if pdf_res.status_code == 200:
+      recs = parse_pdf_for_group(pdf_res.content, b_num, schedule_date)
+      all_records.extend(recs)
+
+  if all_records:
+    supabase.table("schedule").upsert(all_records).execute()
+    print(f"ГОТОВО! Успешно записано пар: {len(all_records)}")
+  else:
+    print("Пар для ДА-61 не найдено ни в одном из корпусов.")
 
 
 if __name__ == "__main__":
   get_schedule()
-  
